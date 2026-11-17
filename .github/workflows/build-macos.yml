@@ -1,0 +1,211 @@
+name: build-macos-dmg
+
+# ⚠️ 本文件是**发行版仓**（公开）里的构建入口（v0.3.174 起）。
+#   为什么不放在源码仓：源码仓 xmaczone/h3-studio 是**私有**的，私有仓的 Actions 分钟数要计费
+#   （macOS runner 更是 10 倍倍率），额度一到就一条都跑不动；公开仓的 Actions 免费且不限量。
+#   ⇒ 构建搬到这里，用 secrets.SRC_TOKEN 把私有源码 checkout 下来编，产物发到**本仓**的
+#     滚动 Release `build-latest`。源码、packages/*.json（工作流图）、试用/计费链路都不公开，
+#      本仓只多出这几个 YAML。
+#   源码仓里同名的 workflow 仅作留档 —— 跑那份仍然会烧私有仓的分钟数。
+
+# 用途：在没有 Mac 的情况下，用 GitHub 的 macOS runner 打真 dmg。
+#
+# **默认不自动编译**：只在手动触发时跑（Actions 页面 → 左侧 build-macos-dmg → Run workflow）。
+# 不打 tag 自动构建 —— macOS 包不是每次发版都要，没必要每次都烧 runner 时间。
+# 需要时手动点一下，产物在本次运行的 Artifacts 里。
+#
+# 说明：这里用**未签名（ad-hoc）**方式打包 —— 不需要 Apple 开发者账号，
+#       代价是首次打开要「右键 → 打开」一次，见 build-macos.sh 末尾提示。
+#       要免提示就得配 APPLE_CERTIFICATE / APPLE_ID 等 secrets 走签名+公证。
+#
+# ★ runs-on 为什么是 macos-15，不是 macos-14（2026-11-06 换的）：
+#   GitHub 公告 macOS 14 镜像 **2026-11-02 正式退役**（macos-14 / -large / -xlarge 三个标签）。
+#   退役后行为极具误导：job 在 started 之后 1 秒内变成 cancelled，runner_name 为空、
+#   steps 为 0 —— 看板上既不是"失败"也没有任何 annotation，只有一片灰。
+#   实测记录（省得下次再查一遍）：
+#     · 11-05 15:52 本地，macos-14 仍 success，排队 0.1 分钟就分到 runner；
+#     · 11-06 起 4 次 dispatch 全部 1 秒 cancelled；
+#     · 换 macos-15 后排队 0.1 分钟、macos-15-intel 排队 5.1 分钟，两者都能跑。
+#   所以不是额度、不是并发、不是配置 —— 就是标签没了。
+#   macos-15 是 arm64；universal 包在这里是"原生 arm64 + 交叉 x86_64"，
+#   rust-toolchain 已经把两个 target 都装上了。
+
+permissions:
+  # 滚动 Release 要写权限（v0.3.152 起产物主要发到 Release，见文件末尾那一步）
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "目标架构"
+        required: true
+        default: universal
+        type: choice
+        options: [universal, arm64, x64]
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      # 发行版仓库（公开、只放能装的包）。gh 认这个名字，scripts/prune-release.ts 也读它
+      # —— 仓库名在每条工作流里只写这一处，别再散到 --repo 参数上。
+      GH_REPO: xmaczone/h3-studio-releases
+    steps:
+      - name: 检出私有源码仓（本仓只放 workflow，源码不公开）
+        uses: actions/checkout@v4
+        with:
+          repository: xmaczone/h3-studio
+          ref: main
+          token: ${{ secrets.SRC_TOKEN }}
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # ★ externalBin 缺文件 = `tauri build` 直接红，不是"少个功能"。
+      #   CI 上没有 ..\vendor\ffmpeg\（105 MB，超 GitHub 单文件上限，故意不进仓库），
+      #   所以这一步必须自己备。源用 eugeneware/ffmpeg-static 的 release
+      #   —— 它是静态构建（无 dylib 依赖）且两个架构都发，比第三方下载站稳。
+      #   少这一步，报错是 resource path 'binaries/h3-ffmpeg-*' doesn't exist，
+      #   看着像配置写错了，其实只是没摆文件。
+      - name: 准备 ffmpeg（externalBin 缺了会直接编译失败）
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1"
+          mkdir -p src-tauri/binaries
+          for A in arm64 x64; do
+            case "$A" in
+              arm64) TRIPLE=aarch64-apple-darwin ;;
+              x64)   TRIPLE=x86_64-apple-darwin ;;
+            esac
+            curl -fsSL --retry 3 --retry-delay 5 "$BASE/ffmpeg-darwin-$A.gz" -o "/tmp/ff-$A.gz"
+            gunzip -c "/tmp/ff-$A.gz" > "/tmp/ff-$A"
+            chmod +x "/tmp/ff-$A"
+            install -m 755 "/tmp/ff-$A" "src-tauri/binaries/h3-ffmpeg-$TRIPLE"
+            # 三条事实：架构对得上、体积对得上、是可执行的 Mach-O
+            file "src-tauri/binaries/h3-ffmpeg-$TRIPLE"
+            SZ=$(stat -f%z "src-tauri/binaries/h3-ffmpeg-$TRIPLE")
+            echo "h3-ffmpeg-$TRIPLE: $SZ bytes"
+            [ "$SZ" -gt 20971520 ] || { echo "::error::h3-ffmpeg-$TRIPLE 小于 20MB，不可能是真二进制"; exit 1; }
+          done
+          # universal 打包时 sidecar 得是 fat binary。tauri 不同版本在这里的取法不完全一致
+          # （有的直接找 -universal-apple-darwin，有的拿两份自己合），两个名字都备好最省事：
+          # 多出来的那个文件不会被额外打进包，缺了才会构建失败。
+          lipo -create -output "src-tauri/binaries/h3-ffmpeg-universal-apple-darwin" \
+            "src-tauri/binaries/h3-ffmpeg-aarch64-apple-darwin" \
+            "src-tauri/binaries/h3-ffmpeg-x86_64-apple-darwin"
+          file "src-tauri/binaries/h3-ffmpeg-universal-apple-darwin"
+          ls -lh src-tauri/binaries/
+
+      # 仓库卫生门（docs/architecture §9.5.7）：跟踪的文件里不许有像真密钥的字面量。
+      # 放在编译之前 —— 泄露了就不该产出任何可分发的包。
+      - name: 仓库卫生门（密钥不落源码）
+        run: npx --yes tsx scripts/repo-hygiene.ts
+
+      - name: 决定 Tauri 目标
+        id: t
+        shell: bash
+        run: |
+          ARCH="${{ github.event.inputs.arch || 'universal' }}"
+          case "$ARCH" in
+            universal) echo "flag=--target universal-apple-darwin" >> "$GITHUB_OUTPUT" ;;
+            arm64)     echo "flag=--target aarch64-apple-darwin"          >> "$GITHUB_OUTPUT" ;;
+            x64)       echo "flag=--target x86_64-apple-darwin"           >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: 编译 + 打 dmg
+        # ★ 试用 AI 优化的密钥：编译期经 option_env!("H3_TRIAL_LLM_KEY") 打进二进制，
+        #   只在**试用会话存在**时才会用到（src-tauri/src/trial_llm.rs）。
+        #   走 secret 走不了文件 —— 密钥永远不进仓库，repo-hygiene 门也就不用为它开例外。
+        #   没配这个 secret 时为空，包照出，只是试用期没有 AI 优化（界面会明说没开通）。
+        env:
+          H3_TRIAL_LLM_KEY: ${{ secrets.H3_TRIAL_LLM_KEY }}
+        run: npx tauri build ${{ steps.t.outputs.flag }}
+
+      - name: 校验产物
+        shell: bash
+        run: |
+          set -e
+          DMG=$(find src-tauri/target -path '*bundle/dmg/*.dmg' | head -1)
+          [ -n "$DMG" ] || { echo "::error::没生成 dmg"; ls -R src-tauri/target/*/release/bundle 2>/dev/null; exit 1; }
+          ls -lh "$DMG"
+          # 确认 app 至少是 ad-hoc 签名的（arm64 未签名会被系统直接 kill）
+          APP=$(find src-tauri/target -maxdepth 6 -path '*bundle/macos/*.app' | head -1)
+          if [ -n "$APP" ]; then codesign -dv "$APP" 2>&1 || echo "::warning::app 未签名，arm64 上可能打不开"; fi
+
+      # 产物改成 ASCII 文件名再分发（v0.3.152）：bundler 用中文 productName（恺悌智算）拼 dmg 名，
+      # 而 `gh release upload` 会把非 ASCII 段吃掉 —— 实测传上去叫 `_0.3.152_universal.dmg`，
+      # 前面孤零零一个下划线，看不出是谁，也看不出是什么。
+      # 与 MSI / deb 那两条口径一致：**只换分发副本的名字**，文件内容与包内信息一字不动。
+      - name: 产物改名（中文 productName → ASCII）
+        shell: bash
+        run: |
+          set -e
+          DMG=$(find src-tauri/target -path '*bundle/dmg/*.dmg' | head -1)
+          VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          mkdir -p dist-dmg
+          cp "$DMG" "dist-dmg/h3-studio_${VER}_${{ inputs.arch }}.dmg"
+          ls -lh dist-dmg
+
+      # 上传失败**不把这次构建判红**（v0.3.150）：账号的 Actions 产物配额常年是满的
+      # （报错 `Artifact storage quota has been hit`），那是仓库存储的事，不是代码的事。
+      # 让它把整条 run 判红，等于"编译成功"和"编译失败"在列表里长得一样 ——
+      # 红着的门等于没有门。产物文件不存在仍然会让这一步红（if-no-files-found: error 照旧）。
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: H3-Studio-macOS-dmg
+          path: dist-dmg/*.dmg
+          if-no-files-found: error
+          # 3 天（v0.3.152 从 14 改来）：Artifacts 是 **500 MiB 账号级配额**，满了 GitHub 直接拒收
+          # （`Artifact storage quota has been hit`），run 却是绿的 —— 表现为"三条全绿、一个包都下不到"。
+          # 长期通道是下面那步 Release（不计配额）。
+          retention-days: 3
+
+      # 产物发到**滚动 Release**（v0.3.152）：Release 附件**不计入** Actions 产物配额。
+      # 起因是 2026-11-14 那次：三条 run 全绿、Artifacts 一个都没有（当时本仓占 911 MiB / 500 MiB）。
+      # 固定 tag `build-latest` 滚动覆盖 —— **不产生版本 tag**，附件名自带版本号。
+      # 传的是上面 staging 出来的 `dist-dmg/*.dmg`（ASCII 名），不是 target 里那份中文名的原件。
+      # ★ v0.3.174 起产物发到**发行版仓库** `xmaczone/h3-studio-releases`（公开）：
+      #   源码仓是私有的，用户拿不到下载入口；发行版仓只放产物，链接能直接发给用户
+      #   （`releases/latest/download/<文件名>`），也不必为了给人下载而公开源码。
+      #   发布在本仓内完成，用自动提供的 GITHUB_TOKEN 即可（不需要跨仓 PAT）。
+      - name: 发到发行版仓库的滚动 Release（不计产物配额）
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view build-latest >/dev/null 2>&1 || \
+            gh release create build-latest --target main \
+              --title "最新构建产物（滚动覆盖）" \
+              --notes "每次 CI 成功后覆盖同名附件。文件名里带版本号，以版本号为准。这里只留最新一版（旧版由紧随其后的清理步骤删掉），历史版本看运行记录。"
+          gh release upload build-latest \
+            dist-dmg/*.dmg --clobber
+
+      # 只留最新一版（2026-11-17 起自动清）：与 build-msi / build-linux 共用同一份判据，
+      # 三条工作流谁最后收尾谁清。理由与两条硬闸写在 scripts/prune-release.ts 顶部。
+      # 清的是**发行版仓库**里那份（脚本读 job 级 env 的 GH_REPO），不是本仓历史 release。
+      - name: 清掉滚动 Release 里的旧版本附件
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx --yes tsx scripts/prune-release.ts
