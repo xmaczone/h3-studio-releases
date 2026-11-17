@@ -1,0 +1,314 @@
+name: build-linux
+
+# ⚠️ 本文件是**发行版仓**（公开）里的构建入口（v0.3.174 起）。
+#   为什么不放在源码仓：源码仓 xmaczone/h3-studio 是**私有**的，私有仓的 Actions 分钟数要计费
+#   （macOS runner 更是 10 倍倍率），额度一到就一条都跑不动；公开仓的 Actions 免费且不限量。
+#   ⇒ 构建搬到这里，用 secrets.SRC_TOKEN 把私有源码 checkout 下来编，产物发到**本仓**的
+#     滚动 Release `build-latest`。源码、packages/*.json（工作流图）、试用/计费链路都不公开，
+#      本仓只多出这几个 YAML。
+#   源码仓里同名的 workflow 仅作留档 —— 跑那份仍然会烧私有仓的分钟数。
+
+# 用途：在没有 Linux 机器的情况下，用 GitHub 的 ubuntu runner 打真 deb / AppImage。
+#
+# **默认不自动编译**：只在手动触发时跑（Actions 页面 → 左侧 build-linux → Run workflow）。
+# 和 macOS 那条一致：不打 tag 自动构建，需要时点一下，产物在本次运行的 Artifacts 里。
+#
+# 为什么不在 Windows 上交叉编译：Tauri 的 Linux 包要链接 webkit2gtk / GTK，
+# 需要目标平台的 sysroot 和链接器，交叉编译出来的东西基本跑不起来。
+# 所以"要 Linux 包"= 用 Linux runner，没有别的干净路子。
+#
+# 只用 ubuntu-22.04（不是 latest）：22.04 的 glibc 2.35 是主流发行版的底线，
+# 在 24.04 上编出来的包放到 Debian 12 / Ubuntu 22.04 上会报 GLIBC_2.39 not found。
+
+permissions:
+  # 滚动 Release 要写权限（v0.3.152 起产物主要发到 Release，见文件末尾那一步）
+  contents: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      # 发行版仓库（公开、只放能装的包）。gh 认这个名字，scripts/prune-release.ts 也读它
+      # —— 仓库名在每条工作流里只写这一处，别再散到 --repo 参数上。
+      GH_REPO: xmaczone/h3-studio-releases
+    steps:
+      - name: 检出私有源码仓（本仓只放 workflow，源码不公开）
+        uses: actions/checkout@v4
+        with:
+          repository: xmaczone/h3-studio
+          ref: main
+          token: ${{ secrets.SRC_TOKEN }}
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # Tauri v2 的 Linux 依赖（webkit2gtk-4.1 / soup3 / appindicator）
+      # libssl-dev + pkg-config：reqwest 走 native-tls ⇒ Linux 上是 openssl-sys，
+      # 缺了会在编译期报 "Could not find openssl"。runner 镜像通常自带，但显式装上
+      # 才不会因为镜像换代就莫名红掉。
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            pkg-config \
+            patchelf \
+            file \
+            build-essential \
+            curl wget
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # 仓库卫生门（docs/architecture §9.5.7）：跟踪的文件里不许有像真密钥的字面量。
+      - name: 仓库卫生门（密钥不落源码）
+        run: npx --yes tsx scripts/repo-hygiene.ts
+
+      # ★ 随包分发的 ffmpeg（v0.3.111 起是 externalBin，v0.3.118 补上 Linux 这一环）。
+      #
+      #   本机 build-exe.cmd / build-msi.cmd 里那一步是 scripts/stage-ffmpeg.ts：
+      #   从仓库外 `..\vendor\ffmpeg\` 复制成 `src-tauri/binaries/h3-ffmpeg-<triple>`。
+      #   CI 上没有那个 vendor 目录（它故意不进仓库：105 MB，GitHub 单文件上限 100 MB），
+      #   所以就绪这一步只能在这里做 —— **不做的话 tauri build 直接红**：
+      #     resource path `binaries/ffmpeg-x86_64-unknown-linux-gnu` doesn't exist
+      #   这一条是 v0.3.118 实测踩到的：加 sidecar 时只在 Windows 上验过，
+      #   Linux/macOS 两条 CI 从那天起就是红的，只是没人点。
+      #
+      #   源用 johnvansickle 的静态构建：单文件、无 dylib 依赖（拷到任何发行版都能跑），
+      #   体积 42 MB 比 BtbN 的 157 MB 小得多。**GPL 构建** —— 与 Windows 包里的
+      #   gyan.dev essentials 同一口径（都是 GPLv3），三平台的分发义务一致。
+      #
+      #   落地名是 `h3-ffmpeg`，**不是 `ffmpeg`**（v0.3.119）：
+      #   tauri 的 externalBin 在 deb 里固定装到 /usr/bin/，而 Ubuntu 桌面自带的
+      #   ffmpeg 包正占着 /usr/bin/ffmpeg。同名 + 我们没有 `Replaces:` ⇒ `dpkg -i` 报
+      #     trying to overwrite '/usr/bin/ffmpeg', which is also in package ffmpeg:amd64
+      #   装不上，而且报错看起来像"系统的包有问题"。
+      - name: 准备 ffmpeg（externalBin 缺了会直接编译失败）
+        shell: bash
+        run: |
+          set -e
+          TRIPLE=x86_64-unknown-linux-gnu
+          DEST="src-tauri/binaries/h3-ffmpeg-$TRIPLE"
+          mkdir -p src-tauri/binaries
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
+            -o /tmp/ffmpeg-static.tar.xz
+          mkdir -p /tmp/ffx && tar -xJf /tmp/ffmpeg-static.tar.xz -C /tmp/ffx
+          SRC=$(find /tmp/ffx -maxdepth 2 -name ffmpeg -type f | head -1)
+          [ -n "$SRC" ] || { echo "::error::压缩包里没有 ffmpeg"; exit 1; }
+          install -m 755 "$SRC" "$DEST"
+          # 三条事实，少一条就别往下编：能跑、是真 ELF、体积对得上
+          file "$DEST"
+          "$DEST" -hide_banner -version | head -2
+          BYTES=$(stat -c%s "$DEST")
+          echo "h3-ffmpeg size: $BYTES bytes"
+          [ "$BYTES" -gt 20971520 ] || { echo "::error::h3-ffmpeg 小于 20MB，不可能是真二进制"; exit 1; }
+
+      # 只打 deb + AppImage：targets 配的是 "all"，但 ubuntu 上默认没有 rpmbuild，
+      # 一跑 rpm 就整条失败，而我们并不需要 rpm。
+      - name: 编译 + 打包
+        # 与 macOS 那条同源：试用密钥走 secret，不落仓库（Linux 的试用门还没开，
+        # 但包里带上同一个密钥不产生任何差别 —— 它能被用到的前提是"试用会话存在"）。
+        env:
+          H3_TRIAL_LLM_KEY: ${{ secrets.H3_TRIAL_LLM_KEY }}
+        run: npx tauri build --bundles deb,appimage
+
+      # ★ 包名必须是 ASCII（v0.3.106）。
+      #   `tauri-bundler` 把 `productName` 直接写进 control 的 `Package:` 字段，而
+      #   `DebConfig` 里**没有**改包名的配置项。我们的 productName 是中文「恺悌智算」⇒
+      #   用户在 Ubuntu 上 `dpkg -i` 直接报：
+      #     「无效的软件包名存在于 'Package' 字段: 必须以字母或数字开头」
+      #   连装都装不上（dpkg 在解析 control 阶段就拒收，还没到依赖检查）。
+      #   只能打包后改：解包 → 改 Package → 重打。
+      #   顺手把 Depends 归一化：tauri 把 tauri.conf.json 里配的依赖**追加**在它自己
+      #   探测出来的旧名后面，会得到
+      #     libgtk-3-0 | libgtk-3-0t64, …, libgtk-3-0, libwebkit2gtk-4.1-0
+      #   同一个名字出现两次。dpkg 能忍，但 24.04 上解析容易让人看错，必须去重。
+      - name: 修正 deb 包名（中文 productName → ASCII）+ Depends 去重
+        shell: bash
+        run: |
+          set -e
+          DEB=$(ls src-tauri/target/release/bundle/deb/*.deb | head -1)
+          VER=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          WORK=$(mktemp -d)
+          dpkg-deb -R "$DEB" "$WORK"
+          PKG=h3-studio python3 - "$WORK/DEBIAN/control" <<'PY'
+          import os, sys
+          path = sys.argv[1]
+          lines = open(path, encoding="utf-8").read().splitlines()
+          out = []
+          for ln in lines:
+              if ln.startswith("Package:"):
+                  out.append("Package: " + os.environ["PKG"])
+              elif ln.startswith("Depends:"):
+                  items = [x.strip() for x in ln[len("Depends:"):].split(",") if x.strip()]
+                  groups = [[a.strip() for a in it.split("|") if a.strip()] for it in items]
+                  uniq = []
+                  for g in groups:
+                      if g not in uniq:
+                          uniq.append(g)
+                  # 单个名字如果已经出现在某个「或」组里，就丢掉（否则同一依赖写两遍）
+                  alts = [g for g in uniq if len(g) > 1]
+                  flat = []
+                  for g in uniq:
+                      if len(g) == 1 and any(g[0] in a for a in alts):
+                          continue
+                      flat.append(" | ".join(g))
+                  out.append("Depends: " + ", ".join(flat))
+              else:
+                  out.append(ln)
+          open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
+          PY
+          echo "--- 改完的 control ---"; cat "$WORK/DEBIAN/control"
+          dpkg-deb -b "$WORK" "src-tauri/target/release/bundle/deb/h3-studio_${VER}_amd64.deb"
+          rm -f "$DEB"
+          # 用 dpkg-deb -I 读回来，证明 dpkg 自己认得出这个包名（这才是用户那条命令的等价检查）
+          dpkg-deb -I "src-tauri/target/release/bundle/deb/h3-studio_${VER}_amd64.deb" \
+            | grep -E '^ (Package|Version|Depends):'
+
+      - name: 产物改成 ASCII 文件名
+        shell: bash
+        run: |
+          set -e
+          VER=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          for f in src-tauri/target/release/bundle/appimage/*.AppImage; do
+            NEW="src-tauri/target/release/bundle/appimage/h3-studio_${VER}_amd64.AppImage"
+            [ "$f" = "$NEW" ] || mv "$f" "$NEW"
+          done
+          ls -lh src-tauri/target/release/bundle/deb/ src-tauri/target/release/bundle/appimage/
+
+      - name: 校验产物
+        shell: bash
+        run: |
+          set -e
+          ls -lh src-tauri/target/release/bundle/deb/*.deb
+          ls -lh src-tauri/target/release/bundle/appimage/*.AppImage
+          # AppImage 必须是可执行且带 ELF 头，否则下下去是个坏文件
+          APPIMG=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -1)
+          chmod +x "$APPIMG"
+          file "$APPIMG" | grep -q ELF || { echo "::error::AppImage 不是 ELF"; exit 1; }
+          # deb 里必须真的有可执行文件（防止打了个空壳）
+          dpkg -c src-tauri/target/release/bundle/deb/*.deb | grep -E 'usr/bin/' | head -3
+          # ★ 内部结构（v0.3.106）：用户报「AppImage 打不开」。
+          #   不看一眼里面长什么样就只能猜。这里把决定性证据都打出来。
+          APPIMG_ABS=$(cd "$(dirname "$APPIMG")" && pwd)/$(basename "$APPIMG")
+          T=$(mktemp -d)
+          (cd "$T" && "$APPIMG_ABS" --appimage-extract >/dev/null 2>&1) || true
+          R="$T/squashfs-root"
+          if [ ! -f "$R/AppRun" ]; then
+            # 解不出来 = 没有证据，不是出事。别用一条假红盖住真问题。
+            echo "::warning::--appimage-extract 没产出 AppRun，跳过内部结构检查"; exit 0
+          fi
+          echo "--- 根目录 ---"; ls "$R" | head -15
+          echo "--- AppRun ---"; head -30 "$R/AppRun"
+          echo "--- usr/bin ---"; ls -l "$R/usr/bin" | head -8
+          echo "--- desktop ---"; head -12 "$R"/*.desktop 2>/dev/null
+          # ★ 两条最容易被漏掉、又恰好表现为「双击没反应、不给报错」的东西：
+          #   ① linuxdeploy-plugin-gtk 的钩子脚本（AppRun 里 source 它，坏在这里就是
+          #      脚本自己静默退出）；
+          #   ② WebKitWebProcess / WebKitNetworkProcess —— WebKitGTK 是**多进程**的，
+          #      主程序只负责拉起它们。缺了这俩，程序起来立刻退，终端最多一行 webkit 报错。
+          echo "--- apprun-hooks ---"; ls -l "$R/apprun-hooks" 2>/dev/null
+          head -40 "$R/apprun-hooks/linuxdeploy-plugin-gtk.sh" 2>/dev/null
+          echo "--- WebKit 子进程 ---"
+          find "$R" \( -name 'WebKitWebProcess*' -o -name 'WebKitNetworkProcess*' \) 2>/dev/null | head -6
+          echo "--- usr/lib 抽样 ---"; ls "$R/usr/lib" 2>/dev/null | head -20
+          # 应用主二进制必须存在（exec 链可能停在 AppRun.wrapped，那条断言就管不到它）
+          ls "$R/usr/bin/"* >/dev/null 2>&1 || { echo "::error::usr/bin 是空的"; exit 1; }
+          echo "--- 二进制缺库检查（只打 not found） ---"
+          find "$R/usr/bin" -maxdepth 1 -type f -perm -u+x | head -3 | while read -r b; do
+            echo "  $b"; ldd "$b" 2>/dev/null | grep -i "not found" || echo "    （无缺失）"
+          done
+          # ★ 顺着 exec 链走到底。linuxdeploy 的链是
+          #     AppRun（脚本）→ AppRun.wrapped → usr/bin/<bin>
+          #   只查第一跳会拿到 `"$this_dir"/AppRun.wrapped` 这种还没展开的路径 ——
+          #   上一版就是因为没展开 $this_dir 而假红了一次（校验自己错了，不是包坏了）。
+          echo "--- exec 链 ---"
+          CUR="$R/AppRun"; OK=0
+          for _hop in 1 2 3 4; do
+            # 注意 `|| true`：`set -e` + pipefail 下，grep 没匹配会让赋值语句
+            # 直接把脚本干掉，报出来的错看起来像另一回事。
+            TGT=$(grep -oE 'exec [^ ]+' "$CUR" 2>/dev/null | head -1 \
+                  | sed -E "s/^exec //; s/[\"']//g" || true)
+            if [ -z "$TGT" ]; then echo "    $CUR 里没有 exec，链到此为止"; break; fi
+            TGT="${TGT//\$\{this_dir\}/$R}"; TGT="${TGT//\$this_dir/$R}"
+            TGT="${TGT//\$\{APPDIR\}/$R}";   TGT="${TGT//\$APPDIR/$R}"
+            TGT="${TGT//\$\{HERE\}/$R}";     TGT="${TGT//\$HERE/$R}"
+            case "$TGT" in /*) ;; *) TGT="$R/$TGT" ;; esac
+            echo "    → $TGT"
+            [ -e "$TGT" ] || { echo "::error::exec 链断了，目标不存在：$TGT"; exit 1; }
+            if head -c 2 "$TGT" | grep -q '#!'; then CUR="$TGT"; continue; fi
+            file "$TGT" | grep -q ELF || { echo "::error::exec 终点不是 ELF：$TGT"; exit 1; }
+            [ -x "$TGT" ] || { echo "::error::exec 终点不可执行：$TGT"; exit 1; }
+            echo "    OK：终点是 ELF 且可执行"; OK=1; break
+          done
+          [ "$OK" = 1 ] || { echo "::error::exec 链 4 跳内没走到 ELF"; exit 1; }
+
+      # 上传失败**不把这次构建判红**（v0.3.150）：账号的 Actions 产物配额常年是满的
+      # （报错 `Artifact storage quota has been hit`），那是仓库存储的事，不是代码的事。
+      # 让它把整条 run 判红，等于"编译成功"和"编译失败"在列表里长得一样 ——
+      # 红着的门等于没有门。产物文件不存在仍然会让这一步红（if-no-files-found: error 照旧）。
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: H3-Studio-Linux-deb-AppImage
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          # 3 天（v0.3.152 从 14 改来）：Artifacts 是 **500 MiB 账号级配额**，满了 GitHub 直接拒收
+          # （`Artifact storage quota has been hit`），run 却是绿的 —— 表现为"三条全绿、一个包都下不到"。
+          # 长期通道是下面那步 Release（不计配额）。
+          retention-days: 3
+
+      # 产物发到**滚动 Release**（v0.3.152）：Release 附件**不计入** Actions 产物配额。
+      # 起因是 2026-11-14 那次：三条 run 全绿、Artifacts 一个都没有（当时本仓占 911 MiB / 500 MiB）。
+      # 固定 tag `build-latest` 滚动覆盖 —— **不产生版本 tag**，附件名自带版本号。
+      # ★ v0.3.174 起产物发到**发行版仓库** `xmaczone/h3-studio-releases`（公开）：
+      #   源码仓是私有的，用户拿不到下载入口；发行版仓只放产物，链接能直接发给用户
+      #   （`releases/latest/download/<文件名>`），也不必为了给人下载而公开源码。
+      #   发布在本仓内完成，用自动提供的 GITHUB_TOKEN 即可（不需要跨仓 PAT）。
+      - name: 发到发行版仓库的滚动 Release（不计产物配额）
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view build-latest >/dev/null 2>&1 || \
+            gh release create build-latest --target main \
+              --title "最新构建产物（滚动覆盖）" \
+              --notes "每次 CI 成功后覆盖同名附件。文件名里带版本号，以版本号为准。这里只留最新一版（旧版由紧随其后的清理步骤删掉），历史版本看运行记录。"
+          gh release upload build-latest \
+            src-tauri/target/release/bundle/deb/*.deb \
+            src-tauri/target/release/bundle/appimage/*.AppImage --clobber
+
+      # 只留最新一版（2026-11-17 起自动清）：与 build-msi / build-macos 共用同一份判据，
+      # 三条工作流谁最后收尾谁清。理由与两条硬闸写在 scripts/prune-release.ts 顶部。
+      # 清的是**发行版仓库**里那份（脚本读 job 级 env 的 GH_REPO），不是本仓历史 release。
+      - name: 清掉滚动 Release 里的旧版本附件
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx --yes tsx scripts/prune-release.ts
