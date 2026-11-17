@@ -1,0 +1,310 @@
+name: build-msi
+
+# ⚠️ 本文件是**发行版仓**（公开）里的构建入口（v0.3.174 起）。
+#   为什么不放在源码仓：源码仓 xmaczone/h3-studio 是**私有**的，私有仓的 Actions 分钟数要计费
+#   （macOS runner 更是 10 倍倍率），额度一到就一条都跑不动；公开仓的 Actions 免费且不限量。
+#   ⇒ 构建搬到这里，用 secrets.SRC_TOKEN 把私有源码 checkout 下来编，产物发到**本仓**的
+#     滚动 Release `build-latest`。源码、packages/*.json（工作流图）、试用/计费链路都不公开，
+#      本仓只多出这几个 YAML。
+#   源码仓里同名的 workflow 仅作留档 —— 跑那份仍然会烧私有仓的分钟数。
+
+# 用途：在没有 Windows 机器的情况下，用 GitHub 的 windows runner 打真 MSI。
+#
+# **默认不自动编译**：只在手动触发时跑（Actions 页面 → 左侧 build-msi → Run workflow）。
+# 和 macOS / Linux 那两条一致：不打 tag 自动构建，需要时点一下，产物在本次运行的 Artifacts 里。
+#
+# 为什么已经有本地 build-msi.cmd 还要这条：
+#   本地那两条 .cmd 走**手工 MSVC 环境**（msvc-env.cmd）—— 因为本机 vcvars64.bat 要调被
+#   黑名单的 reg.exe（docs/architecture §9.5.x）。那是一条绕路，绕路本身是风险。
+#   CI 的 windows-latest 上 MSVC 是干净的、不需要绕，所以这条链的价值有两半：
+#   ① 没有可用的 Windows 机器也能出包；
+#   ② 它跑的是**同一套门**，能证明这些门在一份全新 checkout 上也成立
+#      （首跑就是靠它发现漂移门把 CRLF 当漂移的假红 —— 本机永远绿）。
+#
+# ⚠️ 不要指望两边字节一致。实测同一份代码：本地 15200256 字节（VS2019 14.29），
+#    runner 上 15126528 字节（VS2022）。Rust + PE 构建不可复现，MSVC 版本也不同。
+#    拿 md5 相等当"绕路没改变产物"的判据，是一个永远不可能成立的断言（假红的经典形态）。
+#    能比的是结构事实：包名、版本、OLE 头、载荷比例、构建门里那几个前端文件名。
+#
+# 与本地 .cmd 的门一一对应（判据仍在 scripts/ 里，这里只调用，不许另写一套）：
+#   repo-hygiene.ts   ← build-exe.cmd 第一道门（密钥不落源码）
+#   size-gate.ts      ← build-exe.cmd 第二道门（单文件体积棘轮）
+#   gen-packages.ts --check ← build-exe.cmd 第三道门（packages/*.json 漂移）
+#   verify-exe.ts --skip-stable ← build-exe.cmd 的构建门（--skip-stable：CI 没有"用户实际运行路径"）
+# 与 build-msi.cmd 的对应关系也照它自己的注释：先过三道门，再包 MSI。
+
+permissions:
+  # 滚动 Release 要写权限（v0.3.152 起产物主要发到 Release，见文件末尾那一步）
+  contents: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # 发行版仓库（公开、只放能装的包）。gh 认这个名字，scripts/prune-release.ts 也读它
+      # —— 仓库名在每条工作流里只写这一处，别再散到 --repo 参数上。
+      GH_REPO: xmaczone/h3-studio-releases
+    steps:
+      - name: 检出私有源码仓（本仓只放 workflow，源码不公开）
+        uses: actions/checkout@v4
+        with:
+          repository: xmaczone/h3-studio
+          ref: main
+          token: ${{ secrets.SRC_TOKEN }}
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # ★ 随包分发的 ffmpeg（v0.3.111 起是 externalBin）。
+      #   本机 build-exe.cmd / build-msi.cmd 里那一步是 scripts/stage-ffmpeg.ts：
+      #   从仓库外 `..\vendor\ffmpeg\` 复制成 `src-tauri/binaries/h3-ffmpeg-<triple>.exe`。
+      #   仓库里没有那个目录（单文件 100+ MB，超 GitHub 上限，故意不进仓库），
+      #   所以 CI 必须自己备，否则 `tauri build` 直接红（不是"少个功能"）：
+      #     resource path `binaries\h3-ffmpeg-x86_64-pc-windows-msvc.exe` doesn't exist
+      #   看着像配置写错了，其实只是没摆文件。
+      #
+      # ★ 这一条是 v0.3.142 补的：macOS / Linux 两条工作流从 v0.3.111 起就有这一步，
+      #   build-msi 一直靠**本机**打包（build-msi.cmd 会摆文件），所以缺口一直没暴露 ——
+      #   0.3.135~0.3.141 的 MSI 全是本机出的，CI 那条路从 v0.3.111 起就是断的。
+      #   这就是"有两条出包路径，只有一条真的有人走"的代价：另一条烂了没人知道。
+      #
+      # 源用 gyan.dev 的**定版**包（`packages/ffmpeg-9.0.2-essentials_build.zip`），
+      # 不是 `ffmpeg-release-essentials.zip`（那个是 303 跳转到"最新"，每次编出来的包不一样）。
+      # 挑这一版是为了**和本机 vendor\ffmpeg 完全同源**（本机装的也是 9.0.2-essentials，
+      # 105423872 字节）—— 三个平台的包里 ffmpeg 版本不一致是安静的坑：
+      # 本机能复现的裁剪问题，装 CI 出的包就复现不出来，反过来也一样。
+      # 升级本机 ffmpeg 时这里必须一起改版本号，否则又漂了。
+      - name: 准备 ffmpeg（externalBin 缺了会直接编译失败）
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip"
+          DEST="src-tauri/binaries/h3-ffmpeg-x86_64-pc-windows-msvc.exe"
+          mkdir -p src-tauri/binaries
+          curl -fsSL --retry 3 --retry-delay 5 "$ZIP" -o /tmp/ff-win.zip
+          rm -rf /tmp/ffx && mkdir -p /tmp/ffx
+          # 解压有两条路：Git Bash 的 unzip，没有就退回 7-Zip（镜像里一定有）。
+          # 只写 unzip 的话，遇上没有 unzip 的镜像会红在"找不到命令"这种没信息量的地方。
+          unzip -o -q /tmp/ff-win.zip -d /tmp/ffx || 7z x -y -o/tmp/ffx /tmp/ff-win.zip >/dev/null
+          SRC=$(find /tmp/ffx -name ffmpeg.exe -type f | head -1)
+          [ -n "$SRC" ] || { echo "::error::压缩包里没有 ffmpeg.exe"; exit 1; }
+          install -m 755 "$SRC" "$DEST"
+          # ① PE 头：真 exe 一定以 MZ 开头（下成 HTML 403 页会立刻露馅）
+          [ "$(head -c 2 "$DEST")" = "MZ" ] \
+            || { echo "::error::h3-ffmpeg 不是 PE 文件（前两字节不是 MZ）"; exit 1; }
+          # ② 能跑起来：这条比任何体积/头部判断都硬 —— 跑不动就是跑不动
+          "$DEST" -hide_banner -version | head -2
+          # ③ 版本要真是 9.0.2（和本机同源），不然这个包与本机出的包行为可能不同
+          "$DEST" -hide_banner -version | head -1 | grep -q "version 9\.0\.2" \
+            || { echo "::error::ffmpeg 版本不是 9.0.2，与本机不同源"; exit 1; }
+          # ④ 体积：essentials 静态构建 100MB 上下，小于 20MB 不可能是真的
+          BYTES=$(stat -c%s "$DEST")
+          echo "h3-ffmpeg size: $BYTES bytes"
+          [ "$BYTES" -gt 20971520 ] || { echo "::error::h3-ffmpeg 小于 20MB，不可能是真二进制"; exit 1; }
+          ls -lh src-tauri/binaries/
+
+      # 三道门放在编译之前 —— 逻辑有问题就不该产出任何可分发的包。
+      # 与 build-exe.cmd 同源（那边是 2 秒就红，不要等 4 分钟编译完才发现）。
+
+      - name: 仓库卫生门（密钥不落源码）
+        run: npx --yes tsx scripts/repo-hygiene.ts
+
+      - name: 单文件体积棘轮
+        run: npx --yes tsx scripts/size-gate.ts
+
+      - name: 包清单漂移门
+        run: npx --yes tsx scripts/gen-packages.ts --check
+
+      # --bundles msi only：和 build-msi.cmd 同一个理由 —— targets 是 "all"，
+      # 不限定就会连 NSIS 一起打，那套工具链要额外下载且我们不用。
+      - name: 编译 + 打 MSI
+        # ★ 试用 AI 优化的密钥：编译期经 option_env!("H3_TRIAL_LLM_KEY") 打进二进制，
+        #   只在**试用会话存在**时才会用到（src-tauri/src/trial_llm.rs）。
+        #   走 secret 走不了文件 —— 密钥永远不进仓库，repo-hygiene 门也就不用为它开例外。
+        #   没配这个 secret 时为空，包照出，只是试用期没有 AI 优化（界面会明说没开通）。
+        env:
+          H3_TRIAL_LLM_KEY: ${{ secrets.H3_TRIAL_LLM_KEY }}
+        run: npx tauri build --bundles msi
+
+      # 构建门：确认刚才那个 exe 真的内嵌了前端。
+      # --skip-stable 的理由：这一步比的是 target/release 的 exe 与 dist/，
+      # "拷到 %LOCALAPPDATA%\Programs\h3-studio\" 是本地发布动作，CI 上不存在那个路径。
+      - name: 构建门（exe 真的内嵌了前端）
+        run: npx --yes tsx scripts/verify-exe.ts --skip-stable
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $msi = Get-ChildItem 'src-tauri/target/release/bundle/msi/*.msi' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $msi) {
+            Write-Host '::error::没生成 msi'
+            Get-ChildItem -Recurse -File 'src-tauri/target/release/bundle' -ErrorAction SilentlyContinue |
+              Select-Object FullName
+            exit 1
+          }
+          Write-Host "MSI: $($msi.Name)  $([math]::Round($msi.Length / 1MB, 2)) MiB"
+
+          # 1) 真的是 OLE 复合文档。MSI 的最小结构事实 —— 截断/空文件在 deb 那边叫"无效的软件包名"，
+          #    在 Windows 上叫"安装程序包有问题"，根因都是"文件不是它自称的东西"。
+          #    判据用字节，不用文件存在（存在 ≠ 可装）。
+          $fs = [System.IO.File]::OpenRead($msi.FullName)
+          $head = New-Object byte[] 8
+          $null = $fs.Read($head, 0, 8)
+          $fs.Close()
+          $hex = ($head | ForEach-Object { $_.ToString('x2') }) -join ''
+          Write-Host "OLE 头: $hex"
+          if ($hex -ne 'd0cf11e0a1b11ae1') {
+            Write-Host "::error::不是 OLE 复合文档（头是 $hex），这个 msi 装不上"
+            exit 1
+          }
+
+          # 2) 载荷体积。用**比例**不用绝对值：绝对值在换工具链/换压缩算法时会假红。
+          #    LZX 压完大约是 exe 的一半，留到 0.2 已经很松 —— 真出现"exe 没进包"，
+          #    MSI 会只有几百 KB（图标 + 表结构），这里一定拦得住。
+          $exePath = 'src-tauri/target/release/h3-studio.exe'
+          if (Test-Path $exePath) {
+            $exeLen = (Get-Item $exePath).Length
+            $ratio = [math]::Round($msi.Length / $exeLen, 3)
+            Write-Host "exe $([math]::Round($exeLen / 1MB, 2)) MiB → MSI/exe = $ratio"
+            if ($ratio -lt 0.2) {
+              Write-Host "::error::MSI 只有 exe 的 $ratio 倍，载荷没包进去（空壳 msi）"
+              exit 1
+            }
+          } else {
+            Write-Host "::warning::$exePath 不在，没法做体积比 —— 结构校验已过，这条只是取证缺失"
+          }
+          if ($msi.Length -lt 1MB) {
+            Write-Host "::error::MSI 只有 $($msi.Length) 字节，这不可能是安装包"
+            exit 1
+          }
+
+          # 3) 版本对账：文件名里的版本号必须等于 tauri.conf.json 的 version。
+          #    WiX 用 productName + version 拼文件名，所以这是不依赖 COM 的证据源。
+          #    ★ v0.3.123 起这笔欠账还清了：version 跟着文档版本走（0.3.123），
+          #      不再恒为 0.3.0。这里只做**自洽对账**（文件名 == tauri.conf.json）；
+          #      "三处版本一致"（tauri.conf.json / Cargo.toml / package.json / mcp.rs）
+          #      由本机构建门 scripts/version-gate.ts 守 —— CI 侧刻意没接那一步，
+          #      免得脚本在 runner 上有差异时假红。发布以 build-msi.cmd 出的包为准。
+          #
+          #    ★ 必须显式按 UTF-8 读：那个文件里是中文 productName，而 Get-Content -Raw 在
+          #      Windows PowerShell 上按 GBK 解码 —— 中文变乱码、连引号都被吃掉，
+          #      ConvertFrom-Json 直接报"传入的对象无效"（本机实测过）。
+          #      这里只取一个 ASCII 字段，所以用 regex 而不是整份 ConvertFrom-Json，
+          #      少一层"解析整份 JSON"的依赖。
+          $confPath = 'src-tauri/tauri.conf.json'
+          $conf = [System.IO.File]::ReadAllText(
+            (Join-Path (Get-Location) $confPath),
+            [System.Text.Encoding]::UTF8)
+          $m = [regex]::Match($conf, '"version"\s*:\s*"([^"]+)"')
+          if (-not $m.Success) {
+            Write-Host "::error::读不出 $confPath 里的 version（字段改名了？）"
+            exit 1
+          }
+          $ver = $m.Groups[1].Value
+          Write-Host "tauri.conf.json version = $ver"
+          if ($msi.BaseName -notlike "*_$($ver)_*") {
+            Write-Host "::error::文件名里的版本不是 $ver（$($msi.Name)）—— 别把上一个版本的包发出去"
+            exit 1
+          }
+
+          # 4) 取证（只打印，不断言）：包里到底提没提到我们的 exe。
+          #    为什么不读 Property 表：那要 WindowsInstaller COM，而"读不到时怎么办"只有两种答案，
+          #    两种都错 —— 当成通过是假绿，当成失败是本机策略问题造成的假红。
+          #    所以只用能验的事实（字节/体积/文件名）；这里查不到只发 warning，不当成出事。
+          $bytes = [System.IO.File]::ReadAllBytes($msi.FullName)
+          $needle = 'h3-studio.exe'
+          $hitA = [System.Text.Encoding]::ASCII.GetString($bytes).IndexOf($needle)
+          $hitU = [System.Text.Encoding]::Unicode.GetString($bytes).IndexOf($needle)
+          Write-Host "包里提到 ${needle}: ascii@$hitA  unicode@$hitU"
+          if ($hitA -lt 0 -and $hitU -lt 0) {
+            Write-Host "::warning::字节里找不到 $needle —— 结构校验已过，但值得人工看一眼包里装的是什么"
+          }
+
+          # 5) 产物改成 ASCII 文件名再上传。
+          #    bundler 把 productName（中文"恺悌智算"）原样写进文件名；打进 artifact 的 zip 后
+          #    在 Windows 上解压常见乱码。本地 build-msi.cmd 出的那份仍保留中文名（发给人时认中文），
+          #    这里只换分发用的副本 —— 文件内容不动，dpkg/msi 里读到的名字也不受影响。
+          #    名字里的 h3-studio 是 Cargo 包名（二进制名），不是 productName，两者本来就不一样。
+          New-Item -ItemType Directory -Force -Path 'dist-msi' | Out-Null
+          $stage = Join-Path 'dist-msi' "h3-studio_$($ver)_x64_zh-CN.msi"
+          Copy-Item $msi.FullName $stage -Force
+          $st = Get-Item $stage
+          Write-Host "staged: $($st.Name)  $($st.Length) 字节"
+          if ($st.Length -ne $msi.Length) {
+            Write-Host '::error::改名的副本与原文件大小不一致'
+            exit 1
+          }
+          $md5 = (Get-FileHash $stage -Algorithm MD5).Hash.ToLower()
+          Write-Host "md5: $md5"
+
+      # 上传失败**不把这次构建判红**（v0.3.150）：账号的 Actions 产物配额常年是满的
+      # （报错 `Artifact storage quota has been hit`），那是仓库存储的事，不是代码的事。
+      # 让它把整条 run 判红，等于"编译成功"和"编译失败"在列表里长得一样 ——
+      # 红着的门等于没有门。产物文件不存在仍然会让这一步红（if-no-files-found: error 照旧）。
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: H3-Studio-Windows-MSI
+          path: dist-msi/*.msi
+          if-no-files-found: error
+          # 3 天（v0.3.152 从 14 改来）：Artifacts 是 **500 MiB 账号级配额**，
+          # 一个三件套就 270 MiB，堆两版就满。满了 GitHub 直接拒收
+          # （`Artifact storage quota has been hit`），run 却是绿的 —— 表现为"三条全绿、一个包都下不到"。
+          # 长期通道是下面那步 Release（不计配额），Artifacts 只当临时兜底。
+          retention-days: 3
+
+      # 产物发到**滚动 Release**（v0.3.152）：Release 附件**不计入** Actions 产物配额。
+      # 起因是 2026-11-14 那次：三条 run 全绿、Artifacts 一个都没有（当时本仓占 911 MiB / 500 MiB）。
+      # 用固定 tag `build-latest` 滚动覆盖 —— **不产生版本 tag**（"不打 tag"说的是版本 tag），
+      # 附件名自带版本号，取的时候以文件名里的版本为准。
+      # continue-on-error 同理：传不上去是仓库存储的事，不该把"编译成功"判成"编译失败"。
+      # ★ v0.3.174 起产物发到**发行版仓库** `xmaczone/h3-studio-releases`（公开）：
+      #   源码仓是私有的，用户拿不到下载入口；发行版仓只放产物，链接能直接发给用户
+      #   （`releases/latest/download/<文件名>`），也不必为了给人下载而公开源码。
+      #   发布在本仓内完成，用自动提供的 GITHUB_TOKEN 即可（不需要跨仓 PAT）。
+      - name: 发到发行版仓库的滚动 Release（不计产物配额）
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view build-latest >/dev/null 2>&1 || \
+            gh release create build-latest --target main \
+              --title "最新构建产物（滚动覆盖）" \
+              --notes "每次 CI 成功后覆盖同名附件。文件名里带版本号，以版本号为准。这里只留最新一版（旧版由紧随其后的清理步骤删掉），历史版本看运行记录。"
+          gh release upload build-latest dist-msi/*.msi --clobber
+
+      # 只留最新一版（2026-11-17 起自动清）：三条工作流各自传完自己那份就跑一次，谁最后收尾谁清。
+      # 判据与执行**只有一份**（scripts/prune-release.ts → src/core/release-prune.ts），
+      # 别在 YAML 里另写一段 `gh api -X DELETE` —— 删除不可逆，三份会各自漂的删除逻辑等于没有回滚。
+      # 清的是**发行版仓库**里那份（脚本读 job 级 env 的 GH_REPO），不是本仓历史 release。
+      # 两条硬闸：
+      #   ① 版本号从 tauri.conf.json 读，不从 tag 猜（tag 是固定的 build-latest，里面躺着几个版本是历史事实）；
+      #   ② 当前版本四个平台后缀（msi/dmg/deb/AppImage）齐了才删 —— 刚升版只跑了这一条工作流时，
+      #      现在删会把上一版**完整的三平台包**清光。缺一个就只上传不清理，宁可堆着，不许断档。
+      - name: 清掉滚动 Release 里的旧版本附件
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx --yes tsx scripts/prune-release.ts
